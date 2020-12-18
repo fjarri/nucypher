@@ -23,6 +23,7 @@ tzlocal = "==2.1"
 marshmallow = "*"
 msgpack = "*"
 mako = "*"
+trio = "*"
 # Web
 requests = "*"
 flask = "*"
