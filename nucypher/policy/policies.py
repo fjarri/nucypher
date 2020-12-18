@@ -26,6 +26,7 @@ import math
 import maya
 import random
 import time
+import trio
 from abc import ABC, abstractmethod
 from bytestring_splitter import BytestringSplitter, VariableLengthBytestring
 from constant_sorrow.constants import NOT_SIGNED, UNKNOWN_KFRAG
@@ -37,7 +38,7 @@ from umbral.keys import UmbralPublicKey
 from umbral.kfrags import KFrag
 
 from nucypher.blockchain.eth.actors import BlockchainPolicyAuthor
-from nucypher.blockchain.eth.agents import PolicyManagerAgent
+from nucypher.blockchain.eth.agents import PolicyManagerAgent, StakersReservoir
 from nucypher.characters.lawful import Alice, Ursula
 from nucypher.crypto.api import keccak_digest, secure_random
 from nucypher.crypto.constants import HRAC_LENGTH, PUBLIC_KEY_LENGTH
@@ -317,6 +318,90 @@ class NodeEngagementMutex:
         self._threadpool.start()
 
 
+async def run_workers(worker, value_factory, max_successes, timeout, stagger_timeout):
+
+    successes = {}
+    failures = {}
+    order = []
+
+    async def worker_wrapper(worker, value, cancel):
+        try:
+            result = await worker(value)
+            successes[value] = result
+            if len(successes) >= max_successes:
+                cancel()
+        except Exception as e:
+            failures[value] = e
+
+    with trio.move_on_after(timeout):
+        async with trio.open_nursery() as nursery:
+            cancel = nursery.cancel_scope.cancel
+
+            while True:
+                batch = value_factory(len(successes))
+
+                if not batch:
+                    break
+
+                order += batch
+
+                for value in batch:
+                    nursery.start_soon(worker_wrapper, worker, value, cancel)
+
+                await trio.sleep(stagger_timeout)
+
+    ordered_successes = [successes[value] for value in order if value in successes]
+
+    return ordered_successes, failures
+
+
+def run_workers_sync(*args):
+    return trio.run(run_workers, *args)
+
+
+class LazyReservoir:
+
+    def __init__(self, ursulas, make_reservoir):
+        self.ursulas = list(ursulas)
+        self.make_reservoir = make_reservoir
+        self.reservoir = None
+
+    def __call__(self):
+        reservoir = self.reservoir if self.reservoir is None else (self.reservoir._sampler.elements, self.reservoir._sampler.totals)
+        if self.ursulas:
+            return self.ursulas.pop(0)
+
+        if self.reservoir is None:
+            if self.make_reservoir is not None:
+                self.reservoir = self.make_reservoir()
+                self.make_reservoir = None
+            else:
+                return None
+
+        if len(self.reservoir) > 0:
+            # TODO: can raise StakingEscrowAgent.NotEnoughStakers
+            res = self.reservoir.draw(1)[0]
+            return res
+        else:
+            return None
+
+
+class PrefetchStrategy:
+
+    def __init__(self, reservoir, need_successes):
+        self.reservoir = reservoir
+        self.need_successes = need_successes
+
+    def __call__(self, successes):
+        batch = []
+        for i in range(self.need_successes - successes):
+            value = self.reservoir()
+            if value is None:
+                break
+            batch.append(value)
+        return batch
+
+
 class Policy(ABC):
     """
     An edict by Alice, arranged with n Ursulas, to perform re-encryption for a specific Bob
@@ -513,131 +598,85 @@ class Policy(ABC):
             if publish_treasure_map is True:
                 return self.publish_treasure_map(network_middleware=network_middleware)  # TODO: blockchain_signer?
 
-    def propose_arrangement(self, network_middleware, arrangement) -> bool:
-        negotiation_response = network_middleware.propose_arrangement(arrangement=arrangement)  # Wow, we aren't even passing node here.
+    async def _try_propose_arrangement(self, address,
+            network_middleware: RestMiddleware,
+            discover_on_this_thread: bool,
+            learner_timeout,
+            arrangement_args,
+            arrangement_kwargs
+        ):
 
-        # TODO: check out the response: need to assess the result and see if we're actually good to go.
-        arrangement_is_accepted = negotiation_response.status_code == 200
+        while True:
+            self.alice.block_until_specific_nodes_are_known([address],
+                                                            learn_on_this_thread=discover_on_this_thread,
+                                                            allow_missing=1,
+                                                            timeout=learner_timeout)
+            if address in self.alice.known_nodes:
+                break
 
-        bucket = self._accepted_arrangements if arrangement_is_accepted else self._rejected_arrangements
-        bucket.add(arrangement)
+            await trio.sleep(0)
 
-        return arrangement_is_accepted
+        ursula = self.alice.known_nodes[address]
+        arrangement = self.make_arrangement(ursula=ursula, *arrangement_args, **arrangement_kwargs)
+
+        negotiation_response = network_middleware.propose_arrangement(arrangement=arrangement)
+        is_accepted = negotiation_response.status_code == 200
+
+        #except NodeSeemsToBeDown as e:  # TODO: #355 Also catch InvalidNode here?
+        #    raise
+
+        if not is_accepted:
+            self.log.debug(f"Arrangement failed with {ursula}")
+            raise Exception
+
+        self.log.debug(f"Arrangement accepted by {ursula}")
+
+        return arrangement
 
     def make_arrangements(self,
-                          network_middleware: RestMiddleware,
-                          handpicked_ursulas: Optional[Set[Ursula]] = None,
-                          discover_on_this_thread: bool = True,
-                          *args, **kwargs,
-                          ) -> None:
+                              network_middleware: RestMiddleware,
+                              handpicked_ursulas: Optional[Set[Ursula]] = None,
+                              discover_on_this_thread: bool = True,
+                              *args, **kwargs,
+                              ) -> None:
+        timeout = 10
+        draw_timeout = 1
 
-        sampled_ursulas = self.sample(handpicked_ursulas=handpicked_ursulas,
-                                      discover_on_this_thread=discover_on_this_thread)
+        if handpicked_ursulas is None:
+            handpicked_ursulas = set()
+        handpicked_addresses = [ursula.checksum_address for ursula in handpicked_ursulas]
 
-        if len(sampled_ursulas) < self.n:
-            raise self.MoreKFragsThanArrangements(
-                "To make a Policy in federated mode, you need to designate *all* '  \
-                 the Ursulas you need (in this case, {}); there's no other way to ' \
-                 know which nodes to use.  Either pass them here or when you make ' \
-                 the Policy.".format(self.n))
+        # TODO: is there a better way to determine that?
+        if isinstance(self, BlockchainPolicy):
+            make_reservoir = lambda: self.alice.get_stakers_reservoir(duration=self.duration_periods,
+                                                                      without=handpicked_addresses)
+        else:
+            make_reservoir = lambda: StakersReservoir({ursula.checksum_address: 1 for ursula in self.alice.known_nodes})
 
-        # TODO: One of these layers needs to add concurrency.
-        self._propose_arrangements(network_middleware=network_middleware,
-                                   candidate_ursulas=sampled_ursulas,
-                                   *args, **kwargs)
+        lazy_reservoir = LazyReservoir(handpicked_addresses, make_reservoir)
+        value_factory = PrefetchStrategy(lazy_reservoir, self.n)
 
-        if len(self._accepted_arrangements) < self.n:
-            formatted_offenders = '\n'.join(f'{u.checksum_address}@{u.rest_url()}' for u in sampled_ursulas)
-            raise self.Rejected(f'Selected Ursulas rejected too many arrangements'
-                                f'- only {len(self._accepted_arrangements)} of {self.n} accepted.\n'
-                                f'Offending nodes: \n{formatted_offenders}\n')
+        async def worker(address):
+            return await self._try_propose_arrangement(
+                address, network_middleware, discover_on_this_thread, draw_timeout, args, kwargs)
+
+        arrangements, failures = run_workers_sync(worker, value_factory, self.n, 10, 1)
+
+        for arrangement in arrangements:
+            self._accepted_arrangements.add(arrangement)
+
+        if len(arrangements) < self.n:
+            # TODO: can report on failures here
+            raise self.Rejected(f"Only got {len(arrangements)} out of {self.n}.")
 
     @abstractmethod
     def make_arrangement(self, ursula: Ursula, *args, **kwargs):
         raise NotImplementedError
 
-    @abstractmethod
-    def sample_essential(self, *args, **kwargs) -> Set[Ursula]:
-        raise NotImplementedError
-
-    def sample(self,
-               handpicked_ursulas: Optional[Set[Ursula]] = None,
-               discover_on_this_thread: bool = False,
-               ) -> Set[Ursula]:
-        selected_ursulas = set(handpicked_ursulas) if handpicked_ursulas else set()
-
-        # Calculate the target sample quantity
-        if self.n - len(selected_ursulas) > 0:
-            sampled_ursulas = self.sample_essential(handpicked_ursulas=selected_ursulas,
-                                                    discover_on_this_thread=discover_on_this_thread)
-            selected_ursulas.update(sampled_ursulas)
-
-        return selected_ursulas
-
-    def _propose_arrangements(self,
-                              network_middleware: RestMiddleware,
-                              candidate_ursulas: Set[Ursula],
-                              consider_everyone: bool = False,
-                              *args,
-                              **kwargs) -> None:
-
-        for index, selected_ursula in enumerate(candidate_ursulas):
-            arrangement = self.make_arrangement(ursula=selected_ursula, *args, **kwargs)
-            try:
-                is_accepted = self.propose_arrangement(arrangement=arrangement,
-                                                       network_middleware=network_middleware)
-
-            except NodeSeemsToBeDown as e:  # TODO: #355 Also catch InvalidNode here?
-                # This arrangement won't be added to the accepted bucket.
-                # If too many nodes are down, it will fail in make_arrangements.
-                # Also TODO: Prolly log this or something at this stage.
-                continue
-
-            else:
-                # Bucket the arrangements
-                if is_accepted:
-                    self.log.debug(f"Arrangement accepted by {selected_ursula}")
-                    self._accepted_arrangements.add(arrangement)
-                    accepted = len(self._accepted_arrangements)
-                    if accepted == self.n and not consider_everyone:
-                        try:
-                            spares = set(list(candidate_ursulas)[index + 1::])
-                            self._spare_candidates.update(spares)
-                        except IndexError:
-                            self._spare_candidates = set()
-                        break
-                else:
-                    self.log.debug(f"Arrangement failed with {selected_ursula}")
-                    self._rejected_arrangements.add(arrangement)
-
 
 class FederatedPolicy(Policy):
     _arrangement_class = Arrangement
     from nucypher.policy.collections import TreasureMap as _treasure_map_class  # TODO: Circular Import
-
-    def make_arrangements(self, *args, **kwargs) -> None:
-        try:
-            return super().make_arrangements(*args, **kwargs)
-        except self.MoreKFragsThanArrangements:
-            error = "To make a Policy in federated mode, you need to designate *all* '  \
-                     the Ursulas you need (in this case, {}); there's no other way to ' \
-                     know which nodes to use.  " \
-                    "Pass them here as handpicked_ursulas.".format(self.n)
-            raise self.MoreKFragsThanArrangements(error)  # TODO: NotEnoughUrsulas where in the exception tree is this?
-
-    def sample_essential(self,
-                         handpicked_ursulas: Set[Ursula],
-                         discover_on_this_thread: bool = True) -> Set[Ursula]:
-
-        self.alice.block_until_specific_nodes_are_known(set(ursula.checksum_address for ursula in handpicked_ursulas))
-        self.alice.block_until_number_of_known_nodes_is(self.n, learn_on_this_thread=discover_on_this_thread)
-        known_nodes = self.alice.known_nodes
-        if handpicked_ursulas:
-            # Prevent re-sampling of handpicked ursulas.
-            known_nodes = set(known_nodes) - handpicked_ursulas
-        sampled_ursulas = set(random.sample(k=self.n - len(handpicked_ursulas),
-                                            population=list(known_nodes)))
-        return sampled_ursulas
 
     def make_arrangement(self, ursula: Ursula, *args, **kwargs):
         return self._arrangement_class(alice=self.alice,
@@ -728,71 +767,6 @@ class BlockchainPolicy(Policy):
 
         params = dict(rate=rate, value=value)
         return params
-
-    def sample_essential(self,
-                         handpicked_ursulas: Set[Ursula],
-                         learner_timeout: int = 1,
-                         timeout: int = 10,
-                         discover_on_this_thread: bool = False) -> Set[Ursula]: # TODO #843: Make timeout configurable
-
-        handpicked_addresses = [ursula.checksum_address for ursula in handpicked_ursulas]
-        reservoir = self.alice.get_stakers_reservoir(duration=self.duration_periods,
-                                                     without=handpicked_addresses)
-
-        quantity_remaining = self.n - len(handpicked_ursulas)
-        if len(reservoir) < quantity_remaining:
-            error = f"Cannot create policy with {self.n} arrangements"
-            raise self.NotEnoughBlockchainUrsulas(error)
-
-        # Handpicked Ursulas are not necessarily known
-        to_check = list(handpicked_ursulas) + reservoir.draw(quantity_remaining)
-        checked = []
-
-        # Sample stakers in a loop and feed them to the learner to check
-        # until we have enough in `selected_ursulas`.
-
-        start_time = maya.now()
-
-        while True:
-
-            # Check if the sampled addresses are already known.
-            # If we're lucky, we won't have to wait for the learner iteration to finish.
-            checked += [x for x in to_check if x in self.alice.known_nodes]
-            to_check = [x for x in to_check if x not in self.alice.known_nodes]
-
-            if len(checked) >= self.n:
-                break
-
-            # The number of new nodes to draw on each iteration.
-            # The choice of this depends on how expensive it is to check a node for validity,
-            # and how likely is it for a picked node to be offline.
-            # We assume here that it is unlikely, and be conservative.
-            drawing_step = self.n - len(checked)
-
-            # Draw a little bit more nodes, if there are any
-            to_check += reservoir.draw_at_most(drawing_step)
-
-            delta = maya.now() - start_time
-            if delta.total_seconds() >= timeout:
-                still_checking = ', '.join(to_check)
-                quantity_remaining = self.n - len(checked)
-                raise RuntimeError(f"Timed out after {timeout} seconds; "
-                                   f"need {quantity_remaining} more, still checking {still_checking}.")
-
-            self.alice.block_until_specific_nodes_are_known(to_check,
-                                                            learn_on_this_thread=discover_on_this_thread,
-                                                            allow_missing=len(to_check),
-                                                            timeout=learner_timeout)
-
-        # We only need `n` nodes. Pick the first `n` ones,
-        # since they were the first drawn, and hence have the priority.
-        found_ursulas = [self.alice.known_nodes[address] for address in checked[:self.n]]
-
-        # Randomize the output to avoid the largest stakers always being the first in the list
-        system_random = random.SystemRandom()
-        system_random.shuffle(found_ursulas) # inplace
-
-        return set(found_ursulas)
 
     def publish_to_blockchain(self) -> dict:
 
