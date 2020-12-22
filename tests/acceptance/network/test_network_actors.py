@@ -148,9 +148,9 @@ def test_alice_refuses_to_make_arrangement_unless_ursula_is_valid(blockchain_ali
     vladimir.node_storage.store_node_certificate(certificate=target.certificate)
 
     with pytest.raises(vladimir.InvalidNode):
-        idle_blockchain_policy.propose_arrangement(network_middleware=blockchain_alice.network_middleware,
-                                                   arrangement=FakeArrangement()
-                                                   )
+        idle_blockchain_policy._propose_arrangement(ursula=vladimir,
+                                                    network_middleware=blockchain_alice.network_middleware,
+                                                    arrangement=FakeArrangement())
 
 
 def test_treasure_map_cannot_be_duplicated(blockchain_ursulas,

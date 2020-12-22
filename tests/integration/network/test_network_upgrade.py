@@ -32,8 +32,7 @@ def test_alice_enacts_policies_in_policy_group_via_rest(enacted_federated_policy
     Now that Alice has made a PolicyGroup, she can enact its policies, using Ursula's Public Key to encrypt each offer
     and transmitting them via REST.
     """
-    arrangement = list(enacted_federated_policy._accepted_arrangements)[0]
-    ursula = arrangement.ursula
+    ursula, arrangement = list(enacted_federated_policy._accepted_arrangements.items())[0]
     with ursula.datastore.describe(PolicyArrangement, arrangement.id.hex()) as policy_arrangement:
         the_kfrag = policy_arrangement.kfrag
     assert bool(the_kfrag)  # TODO: This can be a more poignant assertion.

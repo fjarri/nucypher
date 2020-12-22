@@ -140,10 +140,12 @@ class Amonia(Alice):
 
     @staticmethod
     def enact_without_tabulating_responses(policy, network_middleware, *_args, **_kwargs):
-        for arrangement in policy._Policy__assign_kfrags():
-            arrangement_message_kit = arrangement.encrypt_payload_for_ursula()
+        for ursula, kfrag in zip(policy._accepted_arrangements, policy.kfrags):
+            arrangement = policy._accepted_arrangements[ursula]
+            arrangement_message_kit = policy._encrypt_for_enactment(ursula, kfrag)
+
             try:
-                network_middleware.enact_policy(arrangement.ursula,
+                network_middleware.enact_policy(ursula,
                                                 arrangement.id,
                                                 arrangement_message_kit.to_bytes())
             except Exception as e:

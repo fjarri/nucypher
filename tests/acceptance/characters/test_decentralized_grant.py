@@ -54,10 +54,10 @@ def test_decentralized_grant(blockchain_alice, blockchain_bob, agency):
 
     # Let's look at the enacted arrangements.
     for kfrag in policy.kfrags:
-        arrangement = policy._enacted_arrangements[kfrag]
+        ursula, arrangement = policy._enacted_arrangements[kfrag]
 
         # Get the Arrangement from Ursula's datastore, looking up by the Arrangement ID.
-        with arrangement.ursula.datastore.describe(PolicyArrangement, arrangement.id.hex()) as policy_arrangement:
+        with ursula.datastore.describe(PolicyArrangement, arrangement.id.hex()) as policy_arrangement:
             assert kfrag == policy_arrangement.kfrag
 
     # Test PolicyCredential w/o TreasureMap
