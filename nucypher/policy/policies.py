@@ -92,52 +92,16 @@ class Arrangement:
         alice = Alice.from_public_keys(verifying_key=alice_verifying_key)
         return cls(alice=alice, arrangement_id=arrangement_id, expiration=expiration)
 
-    @abstractmethod
-    def revoke(self):
-        """
-        Revoke arrangement.
-        """
-        raise NotImplementedError
-
-
-class BlockchainArrangement(Arrangement):
-    """
-    A relationship between Alice and a single Ursula as part of Blockchain Policy
-    """
-    federated = False
-
-    class InvalidArrangement(Exception):
-        pass
-
-    def __init__(self,
-                 alice: Alice,
-                 expiration: maya.MayaDT,
-                 rate: int,
-                 duration_periods: int,
-                 *args, **kwargs):
-        super().__init__(alice=alice, expiration=expiration, *args, **kwargs)
-
-        # The relationship exists between two addresses
-        self.author = alice  # type: BlockchainPolicyAuthor
-        self.policy_agent = alice.policy_agent  # type: PolicyManagerAgent
-
-        # Arrangement rate and duration in periods
-        self.rate = rate
-        self.duration_periods = duration_periods
+    def revoke(self) -> str:
+        """Revoke this arrangement and return the transaction hash as hex."""
+        txhash = self.alice.policy_agent.revoke_policy(self.id, author_address=self.alice.checksum_address)
+        return txhash
 
     def __repr__(self):
         class_name = self.__class__.__name__
         r = "{}(client={})"
-        r = r.format(class_name, self.author)
+        r = r.format(class_name, self.alice)
         return r
-
-    def revoke(self) -> str:
-        """Revoke this arrangement and return the transaction hash as hex."""
-        # TODO: #1355 - Revoke arrangements only
-        txhash = self.policy_agent.revoke_policy(self.id, author_address=self.author.checksum_address)
-        self.revoke_transaction = txhash
-        self.is_revoked = True
-        return txhash
 
 
 class NodeEngagementMutex:
@@ -387,7 +351,6 @@ class Policy(ABC):
     """
 
     POLICY_ID_LENGTH = 16
-    _arrangement_class = NotImplemented
 
     log = Logger("Policy")
 
@@ -610,7 +573,6 @@ class Policy(ABC):
                               network_middleware: RestMiddleware,
                               handpicked_ursulas: Optional[Set[Ursula]] = None,
                               discover_on_this_thread: bool = True,
-                              *args, **kwargs,
                               ) -> None:
         timeout = 10
         draw_timeout = 1
@@ -630,7 +592,7 @@ class Policy(ABC):
         value_factory = PrefetchStrategy(lazy_reservoir, self.n)
 
         async def worker(address):
-            arrangement = self.make_arrangement(*args, **kwargs)
+            arrangement = self.make_arrangement()
             return await self._try_propose_arrangement(
                 address, network_middleware, arrangement, discover_on_this_thread, draw_timeout)
 
@@ -643,19 +605,13 @@ class Policy(ABC):
             # TODO: can report on failures here
             raise self.Rejected(f"Only got {len(arrangements)} out of {self.n}.")
 
-    @abstractmethod
-    def make_arrangement(self, *args, **kwargs):
-        raise NotImplementedError
+    def make_arrangement(self):
+        return Arrangement(alice=self.alice, expiration=self.expiration)
 
 
 class FederatedPolicy(Policy):
-    _arrangement_class = Arrangement
-    from nucypher.policy.collections import TreasureMap as _treasure_map_class  # TODO: Circular Import
 
-    def make_arrangement(self, *args, **kwargs):
-        return self._arrangement_class(alice=self.alice,
-                                       expiration=self.expiration,
-                                       *args, **kwargs)
+    from nucypher.policy.collections import TreasureMap as _treasure_map_class  # TODO: Circular Import
 
     def _enactment_payload(self, kfrag):
         return bytes(kfrag)
@@ -663,9 +619,9 @@ class FederatedPolicy(Policy):
 
 class BlockchainPolicy(Policy):
     """
-    A collection of n BlockchainArrangements representing a single Policy
+    A collection of n Arrangements representing a single Policy
     """
-    _arrangement_class = BlockchainArrangement
+
     from nucypher.policy.collections import SignedTreasureMap as _treasure_map_class  # TODO: Circular Import
 
     class NoSuchPolicy(Exception):
@@ -759,13 +715,6 @@ class BlockchainPolicy(Policy):
         # Capture Response
         self.receipt = receipt
         self.publish_transaction = receipt['transactionHash']
-
-    def make_arrangement(self, *args, **kwargs):
-        return self._arrangement_class(alice=self.alice,
-                                       expiration=self.expiration,
-                                       rate=self.rate,
-                                       duration_periods=self.duration_periods,
-                                       *args, **kwargs)
 
     def _enactment_payload(self, kfrag):
         return bytes(self.publish_transaction) + bytes(kfrag)
