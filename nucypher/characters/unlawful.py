@@ -182,9 +182,9 @@ class Amonia(Alice):
         an on-chain Policy using PolicyManager, I'm hoping Ursula won't notice.
         """
 
-        def publish_wrong_payee_address_to_blockchain(policy, *args, **kwargs):
+        def publish_wrong_payee_address_to_blockchain(policy):
             receipt = policy.author.policy_agent.create_policy(
-                policy_id=policy.hrac()[:HRAC_LENGTH],  # bytes16 _policyID
+                policy_id=policy.hrac(),  # bytes16 _policyID
                 author_address=policy.author.checksum_address,
                 value=policy.value,
                 end_timestamp=policy.expiration.epoch,  # uint16 _numberOfPeriods
@@ -194,7 +194,6 @@ class Amonia(Alice):
             # Capture Response
             policy.receipt = receipt
             policy.publish_transaction = receipt['transactionHash']
-            policy.is_published = True
 
             return receipt
 
@@ -203,7 +202,7 @@ class Amonia(Alice):
             with patch("nucypher.policy.policies.Policy.enact", self.enact_without_tabulating_responses):
                 return super().grant(handpicked_ursulas=ursulas_to_trick_into_working_for_free, *args, **kwargs)
 
-    def use_ursula_as_an_involuntary_and_unbeknownst_cdn(self, policy, sucker_ursula):
+    def use_ursula_as_an_involuntary_and_unbeknownst_cdn(self, policy, bob, sucker_ursula):
         """
         Ursula is a sucker.
 
@@ -225,7 +224,7 @@ class Amonia(Alice):
             # I'll include a small portion of this awful film in a new message kit.  We don't care about the signature for bob.
             not_the_bees = b"Not the bees!" + int(i).to_bytes(length=4, byteorder="big")
             like_a_map_but_awful.message_kit, _signature_for_bob_which_is_never_Used = encrypt_and_sign(
-                policy.bob.public_keys(DecryptingPower),
+                bob.public_keys(DecryptingPower),
                 plaintext=not_the_bees,
                 signer=self.stamp,
             )

@@ -350,11 +350,11 @@ class Alice(Character, BlockchainPolicyAuthor):
         self.log.debug(f"Enacting {policy} ... ")
 
         # TODO: Make it optional to publish to blockchain?  Or is this presumptive based on the `Policy` type?
-        policy.enact(network_middleware=self.network_middleware, publish_treasure_map=publish_treasure_map)
+        enacted_policy = policy.enact(network_middleware=self.network_middleware, publish_treasure_map=publish_treasure_map)
 
         if publish_treasure_map and block_until_success_is_reasonably_likely:
-            policy.publishing_mutex.block_until_success_is_reasonably_likely()
-        return policy  # Now with TreasureMap affixed!
+            enacted_policy.publishing_mutex.block_until_success_is_reasonably_likely()
+        return enacted_policy  # Now with TreasureMap affixed!
 
     def get_policy_encrypting_key_from_label(self, label: bytes) -> UmbralPublicKey:
         alice_delegating_power = self._crypto_power.power_ups(DelegatingPower)

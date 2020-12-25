@@ -241,10 +241,10 @@ def enacted_federated_policy(idle_federated_policy, federated_ursulas):
     idle_federated_policy.make_arrangements(network_middleware, handpicked_ursulas=federated_ursulas)
 
     # REST call happens here, as does population of TreasureMap.
-    idle_federated_policy.enact(network_middleware)
-    idle_federated_policy.publishing_mutex.block_until_complete()
+    enacted_policy = idle_federated_policy.enact(network_middleware)
+    enacted_policy.publishing_mutex.block_until_complete()
 
-    return idle_federated_policy
+    return enacted_policy
 
 
 @pytest.fixture(scope="module")
@@ -279,9 +279,9 @@ def enacted_blockchain_policy(idle_blockchain_policy, blockchain_ursulas):
     idle_blockchain_policy.make_arrangements(
         network_middleware, handpicked_ursulas=list(blockchain_ursulas))
 
-    idle_blockchain_policy.enact(network_middleware)  # REST call happens here, as does population of TreasureMap.
-    idle_blockchain_policy.publishing_mutex.block_until_complete()
-    return idle_blockchain_policy
+    enacted_policy = idle_blockchain_policy.enact(network_middleware)  # REST call happens here, as does population of TreasureMap.
+    enacted_policy.publishing_mutex.block_until_complete()
+    return enacted_policy
 
 
 @pytest.fixture(scope="module")

@@ -116,25 +116,25 @@ def grant_control_request(federated_bob):
 
 
 @pytest.fixture(scope='module')
-def join_control_request(federated_bob, enacted_federated_policy):
+def join_control_request(federated_alice, federated_bob, enacted_federated_policy):
     method_name = 'join_policy'
 
     params = {
         'label': enacted_federated_policy.label.decode(),
-        'alice_verifying_key': bytes(enacted_federated_policy.alice.stamp).hex(),
+        'alice_verifying_key': bytes(federated_alice.stamp).hex(),
     }
     return method_name, params
 
 
 @pytest.fixture(scope='module')
-def retrieve_control_request(federated_bob, enacted_federated_policy, capsule_side_channel):
+def retrieve_control_request(federated_alice, federated_bob, enacted_federated_policy, capsule_side_channel):
     method_name = 'retrieve'
     message_kit = capsule_side_channel()
 
     params = {
         'label': enacted_federated_policy.label.decode(),
         'policy_encrypting_key': bytes(enacted_federated_policy.public_key).hex(),
-        'alice_verifying_key': bytes(enacted_federated_policy.alice.stamp).hex(),
+        'alice_verifying_key': bytes(federated_alice.stamp).hex(),
         'message_kit': b64encode(message_kit.to_bytes()).decode(),
     }
     return method_name, params

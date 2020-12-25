@@ -364,31 +364,23 @@ class Policy(ABC):
                  kfrags: Tuple[KFrag, ...] = (UNKNOWN_KFRAG,),
                  public_key=None,
                  m: int = None,
-                 alice_signature=NOT_SIGNED) -> None:
+                 ) -> None:
 
         """
         :param kfrags:  A list of KFrags to distribute per this Policy.
         :param label: The identity of the resource to which Bob is granted access.
         """
+        self.m = m
         self.alice = alice
         self.label = label
         self.bob = bob
         self.kfrags = kfrags
         self.public_key = public_key
         self._id = construct_policy_id(self.label, bytes(self.bob.stamp))
-        self.treasure_map = self._treasure_map_class(m=m)
         self.expiration = expiration
 
         self._accepted_arrangements = {}    # type: Set[Arrangement]
-        self._rejected_arrangements = set()    # type: Set[Arrangement]
-        self._spare_candidates = set()         # type: Set[Ursula]
-
-        self._enacted_arrangements = OrderedDict()
-        self._published_arrangements = OrderedDict()
-
-        self.alice_signature = alice_signature  # TODO: This is unused / To Be Implemented?
-
-        self.publishing_mutex = None
+        self._enacted_arrangements = {}
 
     class MoreKFragsThanArrangements(TypeError):
         """
@@ -427,29 +419,43 @@ class Policy(ABC):
         """
         return keccak_digest(bytes(self.alice.stamp) + bytes(self.bob.stamp) + self.label)[:HRAC_LENGTH]
 
-    async def put_treasure_map_on_node(self, node, network_middleware):
-        response = network_middleware.put_treasure_map_on_node(
-            node=node,
-            map_payload=bytes(self.treasure_map))
-        return response
+    def make_treasure_map(self,
+                          network_middleware: RestMiddleware,
+                          blockchain_signer: Callable = None,
+                          ) -> NodeEngagementMutex:
 
-    def publish_treasure_map(self, network_middleware: RestMiddleware,
-                             blockchain_signer: Callable = None) -> NodeEngagementMutex:
-        self.treasure_map.prepare_for_publication(self.bob.public_keys(DecryptingPower),
-                                                  self.bob.public_keys(SigningPower),
-                                                  self.alice.stamp,
-                                                  self.label)
+        treasure_map = self._treasure_map_class(m=self.m)
+
+        for ursula, arrangement in self._enacted_arrangements.values():
+            # TODO: Handle problem here - if the arrangement is bad, deal with it.
+            treasure_map.add_arrangement(ursula, arrangement)
+
+        treasure_map.prepare_for_publication(bob_encrypting_key=self.bob.public_keys(DecryptingPower),
+                                             bob_verifying_key=self.bob.public_keys(SigningPower),
+                                             alice_stamp=self.alice.stamp,
+                                             label=self.label)
+
         if blockchain_signer is not None:
-            self.treasure_map.include_blockchain_signature(blockchain_signer)
+            treasure_map.include_blockchain_signature(blockchain_signer)
+
+        return treasure_map
+
+    def make_publishing_mutex(self,
+                              treasure_map,
+                              network_middleware: RestMiddleware,
+                              ) -> NodeEngagementMutex:
 
         self.alice.block_until_number_of_known_nodes_is(8, timeout=2, learn_on_this_thread=True)
-
         target_nodes = self.bob.matching_nodes_among(self.alice.known_nodes)
-        self.publishing_mutex = NodeEngagementMutex(callable_to_engage=self.put_treasure_map_on_node,
-                                                    nodes=target_nodes,
-                                                    network_middleware=network_middleware)
+        treasure_map_bytes = bytes(treasure_map) # prevent the closure from holding the reference
 
-        self.publishing_mutex.start()
+        async def put_treasure_map_on_node(node, network_middleware):
+            return network_middleware.put_treasure_map_on_node(node=node,
+                                                               map_payload=treasure_map_bytes)
+
+        return NodeEngagementMutex(callable_to_engage=put_treasure_map_on_node,
+                                   nodes=target_nodes,
+                                   network_middleware=network_middleware)
 
     @abstractmethod
     def _enactment_payload(self, kfrag):
@@ -492,9 +498,6 @@ class Policy(ABC):
             # TODO: temporary, to make tests pass
             self._enacted_arrangements[kfrag] = (ursula, arrangement)
 
-            # TODO: Handle problem here - if the arrangement is bad, deal with it.
-            self.treasure_map.add_arrangement(ursula, arrangement)
-
         # OK, let's check: if two or more Ursulas claimed we didn't pay,
         # we need to re-evaulate our situation here.
         number_of_claims_of_freeloading = sum(status == 402 for status in arrangement_statuses)
@@ -502,18 +505,25 @@ class Policy(ABC):
         if number_of_claims_of_freeloading > 2:
             raise self.alice.NotEnoughNodes  # TODO: Clean this up and enable re-tries.
 
-        self.treasure_map.check_for_sufficient_destinations()
-
         # TODO: Leave a note to try any failures later.
         pass
 
         # ...After *all* the arrangements are enacted
-        # Create Alice's revocation kit
-        self.revocation_kit = RevocationKit(self, self.alice.stamp)
-        self.alice.add_active_policy(self)
+
+        treasure_map = self.make_treasure_map(network_middleware=network_middleware,
+                                              blockchain_signer=self._blockchain_signer())
+        publishing_mutex = self.make_publishing_mutex(treasure_map=treasure_map,
+                                                      network_middleware=network_middleware)
+        revocation_kit = RevocationKit(treasure_map, self.alice.stamp)
+
+        enacted_policy = EnactedPolicy(self._id, self.hrac(), self.label, self.public_key, self._enacted_arrangements, treasure_map, publishing_mutex, revocation_kit)
+
+        self.alice.add_active_policy(enacted_policy)
 
         if publish_treasure_map is True:
-            return self.publish_treasure_map(network_middleware=network_middleware)  # TODO: blockchain_signer?
+            enacted_policy.publish_treasure_map()
+
+        return enacted_policy
 
     def _propose_arrangement(self, ursula, network_middleware: RestMiddleware, arrangement):
         negotiation_response = network_middleware.propose_arrangement(ursula, arrangement)
@@ -590,6 +600,10 @@ class Policy(ABC):
     def make_arrangement(self):
         return Arrangement(alice=self.alice, expiration=self.expiration)
 
+    @abstractmethod
+    def _blockchain_signer(self):
+        raise NotImplementedError
+
 
 class FederatedPolicy(Policy):
 
@@ -597,6 +611,9 @@ class FederatedPolicy(Policy):
 
     def _enactment_payload(self, kfrag):
         return bytes(kfrag)
+
+    def _blockchain_signer(self):
+        return None
 
 
 class BlockchainPolicy(Policy):
@@ -701,6 +718,10 @@ class BlockchainPolicy(Policy):
     def _enactment_payload(self, kfrag):
         return bytes(self.publish_transaction) + bytes(kfrag)
 
+    def _blockchain_signer(self):
+        transacting_power = self.alice._crypto_power.power_ups(TransactingPower)
+        return transacting_power.sign_message
+
     def enact(self, network_middleware, publish_to_blockchain=True, publish_treasure_map=True) -> NodeEngagementMutex:
         """
         Assign kfrags to ursulas_on_network, and distribute them via REST,
@@ -709,15 +730,20 @@ class BlockchainPolicy(Policy):
         if publish_to_blockchain is True:
             self.publish_to_blockchain()
 
-        publisher = super().enact(network_middleware, publish_treasure_map=False)
+        return super().enact(network_middleware, publish_treasure_map=publish_treasure_map)
 
-        if publish_treasure_map is True:
-            self.treasure_map.prepare_for_publication(bob_encrypting_key=self.bob.public_keys(DecryptingPower),
-                                                      bob_verifying_key=self.bob.public_keys(SigningPower),
-                                                      alice_stamp=self.alice.stamp,
-                                                      label=self.label)
-            # Sign the map.
-            transacting_power = self.alice._crypto_power.power_ups(TransactingPower)
-            publisher = self.publish_treasure_map(network_middleware=network_middleware,
-                                                  blockchain_signer=transacting_power.sign_message)
-        return publisher
+
+class EnactedPolicy:
+
+    def __init__(self, id, hrac, label, public_key, enacted_arrangements, treasure_map, publishing_mutex, revocation_kit):
+        self.id = id # TODO: is it even used anywhere?
+        self.hrac = hrac
+        self.label = label
+        self.public_key = public_key
+        self.treasure_map = treasure_map
+        self.publishing_mutex = publishing_mutex
+        self.revocation_kit = revocation_kit
+        self.n = len(enacted_arrangements)
+
+    def publish_treasure_map(self):
+        self.publishing_mutex.start()
