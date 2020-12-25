@@ -54,17 +54,22 @@ class Arrangement:
     """
     A Policy must be implemented by arrangements with n Ursulas.  This class tracks the status of that implementation.
     """
-    federated = True
     ID_LENGTH = 32
 
     splitter = BytestringSplitter((UmbralPublicKey, PUBLIC_KEY_LENGTH),  # alice.stamp
                                   (bytes, ID_LENGTH),  # arrangement_ID
                                   (bytes, VariableLengthBytestring))  # expiration
 
+    @classmethod
+    def from_alice(cls, alice: Alice, expiration: maya.MayaDT):
+        arrangement_id = secure_random(cls.ID_LENGTH)
+        alice_verifying_key = alice.stamp
+        return cls(alice_verifying_key, expiration, arrangement_id)
+
     def __init__(self,
-                 alice: Alice,
+                 alice_verifying_key,
                  expiration: maya.MayaDT,
-                 arrangement_id: bytes = None,
+                 arrangement_id: bytes,
                  ) -> None:
         """
         :param expiration: The moment which Alice wants the Arrangement to end.
@@ -72,35 +77,23 @@ class Arrangement:
         Other params are hopefully self-evident.
         """
         # TODO: do we really need different IDs for each arrangement in the policy?
-        if arrangement_id:
-            if len(arrangement_id) != self.ID_LENGTH:
-                raise ValueError(f"Arrangement ID must be of length {self.ID_LENGTH}.")
-            self.id = arrangement_id
-        else:
-            self.id = secure_random(self.ID_LENGTH)
+        if len(arrangement_id) != self.ID_LENGTH:
+            raise ValueError(f"Arrangement ID must be of length {self.ID_LENGTH}.")
+        self.id = arrangement_id
         self.expiration = expiration
-        self.alice = alice
+        self.alice_verifying_key = alice_verifying_key
 
     def __bytes__(self):
-        return bytes(self.alice.stamp) + self.id + bytes(VariableLengthBytestring(self.expiration.iso8601().encode()))
+        return bytes(self.alice_verifying_key) + self.id + bytes(VariableLengthBytestring(self.expiration.iso8601().encode()))
 
     @classmethod
     def from_bytes(cls, arrangement_as_bytes):
         alice_verifying_key, arrangement_id, expiration_bytes = cls.splitter(arrangement_as_bytes)
         expiration = maya.MayaDT.from_iso8601(iso8601_string=expiration_bytes.decode())
-        alice = Alice.from_public_keys(verifying_key=alice_verifying_key)
-        return cls(alice=alice, arrangement_id=arrangement_id, expiration=expiration)
-
-    def revoke(self) -> str:
-        """Revoke this arrangement and return the transaction hash as hex."""
-        txhash = self.alice.policy_agent.revoke_policy(self.id, author_address=self.alice.checksum_address)
-        return txhash
+        return cls(alice_verifying_key=alice_verifying_key, arrangement_id=arrangement_id, expiration=expiration)
 
     def __repr__(self):
-        class_name = self.__class__.__name__
-        r = "{}(client={})"
-        r = r.format(class_name, self.alice)
-        return r
+        return f"Arrangement(client_key={self.alice_verifying_key})"
 
 
 class NodeEngagementMutex:
@@ -598,7 +591,7 @@ class Policy(ABC):
             raise self.Rejected(f"Only got {len(arrangements)} out of {self.n}.")
 
     def make_arrangement(self):
-        return Arrangement(alice=self.alice, expiration=self.expiration)
+        return Arrangement.from_alice(alice=self.alice, expiration=self.expiration)
 
     @abstractmethod
     def _blockchain_signer(self):
