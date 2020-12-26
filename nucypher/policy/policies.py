@@ -372,9 +372,6 @@ class Policy(ABC):
         self._id = construct_policy_id(self.label, bytes(self.bob.stamp))
         self.expiration = expiration
 
-        self._accepted_arrangements = {}    # type: Set[Arrangement]
-        self._enacted_arrangements = {}
-
     class MoreKFragsThanArrangements(TypeError):
         """
         Raised when a Policy has been used to generate Arrangements with Ursulas insufficient number
@@ -391,10 +388,6 @@ class Policy(ABC):
 
     def __repr__(self):
         return f"{self.__class__.__name__}:{self.id.hex()[:6]}"
-
-    @property
-    def accepted_ursulas(self) -> Set[Ursula]:
-        return set(self._accepted_arrangements)
 
     def hrac(self) -> bytes:
         """
@@ -414,12 +407,13 @@ class Policy(ABC):
 
     def make_treasure_map(self,
                           network_middleware: RestMiddleware,
+                          arrangements,
                           blockchain_signer: Callable = None,
                           ) -> NodeEngagementMutex:
 
         treasure_map = self._treasure_map_class(m=self.m)
 
-        for ursula, arrangement in self._enacted_arrangements.values():
+        for ursula, arrangement in arrangements.items():
             # TODO: Handle problem here - if the arrangement is bad, deal with it.
             treasure_map.add_arrangement(ursula, arrangement)
 
@@ -450,66 +444,30 @@ class Policy(ABC):
                                    nodes=target_nodes,
                                    network_middleware=network_middleware)
 
-    @abstractmethod
-    def _enactment_payload(self, kfrag):
-        raise NotImplementedError
+    def enact(self,
+              network_middleware: RestMiddleware,
+              handpicked_ursulas: Optional[Set[Ursula]] = None,
+              discover_on_this_thread: bool = True,
+              publish_treasure_map=True,
+              ) -> 'EnactedPolicy':
 
-    def _encrypt_for_enactment(self, ursula, kfrag):
-        """Craft an offer to send to Ursula."""
-        # TODO: seems like it would be enough to just encrypt this with Ursula's public key,
-        # and not create a whole capsule.
-        # Can't change for now since it's node protocol.
-        message_kit, _signature = self.alice.encrypt_for(ursula, self._enactment_payload(kfrag))
-        return message_kit
+        arrangements = self.make_arrangements(network_middleware=network_middleware,
+                                              handpicked_ursulas=handpicked_ursulas,
+                                              discover_on_this_thread=discover_on_this_thread)
 
-    def enact(self, network_middleware, publish_treasure_map=True) -> dict:
-        """
-        Assign kfrags to ursulas_on_network, and distribute them via REST,
-        populating enacted_arrangements
-        """
-        if len(self._accepted_arrangements) < self.n:
-            raise self.MoreKFragsThanArrangements("Not enough candidate arrangements. "
-                                                  "Call make_arrangements to make more.")
-
-        arrangement_statuses = []
-        for ursula, kfrag in zip(self._accepted_arrangements, self.kfrags):
-            arrangement = self._accepted_arrangements[ursula]
-            arrangement_message_kit = self._encrypt_for_enactment(ursula, kfrag)
-
-            try:
-                # TODO: Concurrency
-                response = network_middleware.enact_policy(ursula,
-                                                           arrangement.id,
-                                                           arrangement_message_kit.to_bytes())
-            except network_middleware.UnexpectedResponse as e:
-                status = e.status
-            else:
-                status = response.status_code
-
-            arrangement_statuses.append(status)
-
-            # TODO: temporary, to make tests pass
-            self._enacted_arrangements[kfrag] = (ursula, arrangement)
-
-        # OK, let's check: if two or more Ursulas claimed we didn't pay,
-        # we need to re-evaulate our situation here.
-        number_of_claims_of_freeloading = sum(status == 402 for status in arrangement_statuses)
-
-        if number_of_claims_of_freeloading > 2:
-            raise self.alice.NotEnoughNodes  # TODO: Clean this up and enable re-tries.
-
-        # TODO: Leave a note to try any failures later.
-        pass
-
-        # ...After *all* the arrangements are enacted
+        self.enact_arrangements(network_middleware=network_middleware,
+                                arrangements=arrangements,
+                                publish_treasure_map=publish_treasure_map,
+                                make_enactment_payload=lambda kfrag: bytes(kfrag))
 
         treasure_map = self.make_treasure_map(network_middleware=network_middleware,
+                                              arrangements=arrangements,
                                               blockchain_signer=self._blockchain_signer())
         publishing_mutex = self.make_publishing_mutex(treasure_map=treasure_map,
                                                       network_middleware=network_middleware)
         revocation_kit = RevocationKit(treasure_map, self.alice.stamp)
 
-        enacted_policy = EnactedPolicy(self._id, self.hrac(), self.label, self.public_key, self._enacted_arrangements, treasure_map, publishing_mutex, revocation_kit)
+        enacted_policy = EnactedPolicy(self._id, self.hrac(), self.label, self.public_key, treasure_map, publishing_mutex, revocation_kit)
 
         self.alice.add_active_policy(enacted_policy)
 
@@ -517,6 +475,42 @@ class Policy(ABC):
             enacted_policy.publish_treasure_map()
 
         return enacted_policy
+
+    def enact_arrangements(self,
+                           network_middleware,
+                           arrangements,
+                           make_enactment_payload,
+                           publish_treasure_map=True) -> dict:
+        """
+        Assign kfrags to ursulas_on_network, and distribute them via REST.
+        """
+        arrangement_statuses = []
+        for ursula, kfrag in zip(arrangements, self.kfrags):
+            arrangement = arrangements[ursula]
+
+            # TODO: seems like it would be enough to just encrypt this with Ursula's public key,
+            # and not create a whole capsule.
+            # Can't change for now since it's node protocol.
+            message_kit, _signature = self.alice.encrypt_for(ursula, make_enactment_payload(kfrag))
+
+            try:
+                # TODO: Concurrency
+                response = network_middleware.enact_policy(ursula,
+                                                           arrangement.id,
+                                                           message_kit.to_bytes())
+            except network_middleware.UnexpectedResponse as e:
+                status = e.status
+            else:
+                status = response.status_code
+
+            arrangement_statuses.append(status)
+
+        # OK, let's check: if two or more Ursulas claimed we didn't pay,
+        # we need to re-evaulate our situation here.
+        number_of_claims_of_freeloading = sum(status == 402 for status in arrangement_statuses)
+
+        if number_of_claims_of_freeloading > 2:
+            raise self.alice.NotEnoughNodes  # TODO: Clean this up and enable re-tries.
 
     def _propose_arrangement(self, ursula, network_middleware: RestMiddleware, arrangement):
         negotiation_response = network_middleware.propose_arrangement(ursula, arrangement)
@@ -562,6 +556,8 @@ class Policy(ABC):
         timeout = 10
         draw_timeout = 1
 
+        accepted_arrangements = {}
+
         if handpicked_ursulas is None:
             handpicked_ursulas = set()
         handpicked_addresses = [ursula.checksum_address for ursula in handpicked_ursulas]
@@ -584,11 +580,13 @@ class Policy(ABC):
         arrangements, failures = run_workers_sync(worker, value_factory, self.n, 10, 1)
 
         for ursula, arrangement in arrangements:
-            self._accepted_arrangements[ursula] = arrangement
+            accepted_arrangements[ursula] = arrangement
 
         if len(arrangements) < self.n:
             # TODO: can report on failures here
             raise self.Rejected(f"Only got {len(arrangements)} out of {self.n}.")
+
+        return accepted_arrangements
 
     def make_arrangement(self):
         return Arrangement.from_alice(alice=self.alice, expiration=self.expiration)
@@ -601,9 +599,6 @@ class Policy(ABC):
 class FederatedPolicy(Policy):
 
     from nucypher.policy.collections import TreasureMap as _treasure_map_class  # TODO: Circular Import
-
-    def _enactment_payload(self, kfrag):
-        return bytes(kfrag)
 
     def _blockchain_signer(self):
         return None
@@ -640,7 +635,6 @@ class BlockchainPolicy(Policy):
         self.expiration = expiration
         self.value = value
         self.rate = rate
-        self.author = alice
 
         # Initial State
         self.publish_transaction = None
@@ -691,44 +685,41 @@ class BlockchainPolicy(Policy):
         params = dict(rate=rate, value=value)
         return params
 
-    def publish_to_blockchain(self) -> dict:
+    def publish_to_blockchain(self, ursulas) -> dict:
 
-        prearranged_ursulas = list(ursula.checksum_address for ursula in self._accepted_arrangements)
+        addresses = [ursula.checksum_address for ursula in ursulas]
 
         # Transact  # TODO: Move this logic to BlockchainPolicyActor
-        receipt = self.author.policy_agent.create_policy(
+        receipt = self.alice.policy_agent.create_policy(
             policy_id=self.hrac(),  # bytes16 _policyID
-            author_address=self.author.checksum_address,
+            author_address=self.alice.checksum_address,
             value=self.value,
             end_timestamp=self.expiration.epoch,  # uint16 _numberOfPeriods
-            node_addresses=prearranged_ursulas  # address[] memory _nodes
+            node_addresses=addresses  # address[] memory _nodes
         )
 
         # Capture Response
-        self.receipt = receipt
-        self.publish_transaction = receipt['transactionHash']
-
-    def _enactment_payload(self, kfrag):
-        return bytes(self.publish_transaction) + bytes(kfrag)
+        return receipt['transactionHash']
 
     def _blockchain_signer(self):
         transacting_power = self.alice._crypto_power.power_ups(TransactingPower)
         return transacting_power.sign_message
 
-    def enact(self, network_middleware, publish_to_blockchain=True, publish_treasure_map=True) -> NodeEngagementMutex:
-        """
-        Assign kfrags to ursulas_on_network, and distribute them via REST,
-        populating enacted_arrangements
-        """
-        if publish_to_blockchain is True:
-            self.publish_to_blockchain()
-
-        return super().enact(network_middleware, publish_treasure_map=publish_treasure_map)
+    def enact_arrangements(self,
+                           network_middleware,
+                           arrangements,
+                           make_enactment_payload,
+                           publish_treasure_map=True) -> NodeEngagementMutex:
+        transaction = self.publish_to_blockchain(list(arrangements))
+        return super().enact_arrangements(network_middleware=network_middleware,
+                                          arrangements=arrangements,
+                                          publish_treasure_map=publish_treasure_map,
+                                          make_enactment_payload=lambda kfrag: bytes(transaction) + make_enactment_payload(kfrag))
 
 
 class EnactedPolicy:
 
-    def __init__(self, id, hrac, label, public_key, enacted_arrangements, treasure_map, publishing_mutex, revocation_kit):
+    def __init__(self, id, hrac, label, public_key, treasure_map, publishing_mutex, revocation_kit):
         self.id = id # TODO: is it even used anywhere?
         self.hrac = hrac
         self.label = label
@@ -736,7 +727,7 @@ class EnactedPolicy:
         self.treasure_map = treasure_map
         self.publishing_mutex = publishing_mutex
         self.revocation_kit = revocation_kit
-        self.n = len(enacted_arrangements)
+        self.n = len(self.treasure_map.destinations)
 
     def publish_treasure_map(self):
         self.publishing_mutex.start()
