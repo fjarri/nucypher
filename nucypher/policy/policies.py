@@ -247,7 +247,6 @@ async def run_workers(worker, value_factory, max_successes, timeout, stagger_tim
 
     successes = {}
     failures = {}
-    order = []
 
     async def worker_wrapper(worker, value, cancel):
         try:
@@ -256,8 +255,6 @@ async def run_workers(worker, value_factory, max_successes, timeout, stagger_tim
             if len(successes) >= max_successes:
                 cancel()
         except Exception as e:
-            import traceback
-            traceback.print_exc()
             failures[value] = e
 
     with trio.move_on_after(timeout):
@@ -270,16 +267,17 @@ async def run_workers(worker, value_factory, max_successes, timeout, stagger_tim
                 if not batch:
                     break
 
-                order += batch
-
                 for value in batch:
                     nursery.start_soon(worker_wrapper, worker, value, cancel)
 
                 await trio.sleep(stagger_timeout)
 
-    ordered_successes = [successes[value] for value in order if value in successes]
+    # Due to a race in worker_wrapper(), we can end up with more than `max_successes` successes.
+    # Just discard the excess ones.
+    for _ in range(len(successes) - max_successes):
+        successes.popitem()
 
-    return ordered_successes, failures
+    return successes, failures
 
 
 def run_workers_sync(*args):
@@ -288,15 +286,14 @@ def run_workers_sync(*args):
 
 class LazyReservoir:
 
-    def __init__(self, ursulas, make_reservoir):
-        self.ursulas = list(ursulas)
+    def __init__(self, values, make_reservoir):
+        self.values = list(values)
         self.make_reservoir = make_reservoir
         self.reservoir = None
 
     def __call__(self):
-        reservoir = self.reservoir if self.reservoir is None else (self.reservoir._sampler.elements, self.reservoir._sampler.totals)
-        if self.ursulas:
-            return self.ursulas.pop(0)
+        if self.values:
+            return self.values.pop(0)
 
         if self.reservoir is None:
             if self.make_reservoir is not None:
@@ -306,9 +303,7 @@ class LazyReservoir:
                 return None
 
         if len(self.reservoir) > 0:
-            # TODO: can raise StakingEscrowAgent.NotEnoughStakers
-            res = self.reservoir.draw(1)[0]
-            return res
+            return self.reservoir.draw(1)[0]
         else:
             return None
 
@@ -346,8 +341,16 @@ class Policy(ABC):
 
     log = Logger("Policy")
 
-    class Rejected(RuntimeError):
-        """Too many Ursulas rejected"""
+    class NotEnoughUrsulas(Exception):
+        """
+        Raised when a Policy has been used to generate Arrangements with Ursulas insufficient number
+        such that we don't have enough KFrags to give to each Ursula.
+        """
+
+    class EnactmentError(Exception):
+        """
+        Raise if one or more Ursulas failed to enact the policy.
+        """
 
     def __init__(self,
                  alice: Alice,
@@ -371,12 +374,6 @@ class Policy(ABC):
         self.public_key = public_key
         self._id = construct_policy_id(self.label, bytes(self.bob.stamp))
         self.expiration = expiration
-
-    class MoreKFragsThanArrangements(TypeError):
-        """
-        Raised when a Policy has been used to generate Arrangements with Ursulas insufficient number
-        such that we don't have enough KFrags to give to each Ursula.
-        """
 
     @property
     def n(self) -> int:
@@ -484,7 +481,7 @@ class Policy(ABC):
         """
         Assign kfrags to ursulas_on_network, and distribute them via REST.
         """
-        arrangement_statuses = []
+        statuses = {}
         for ursula, kfrag in zip(arrangements, self.kfrags):
             arrangement = arrangements[ursula]
 
@@ -503,27 +500,35 @@ class Policy(ABC):
             else:
                 status = response.status_code
 
-            arrangement_statuses.append(status)
+            statuses[ursula.checksum_address] = status
 
-        # OK, let's check: if two or more Ursulas claimed we didn't pay,
-        # we need to re-evaulate our situation here.
-        number_of_claims_of_freeloading = sum(status == 402 for status in arrangement_statuses)
+        # TODO: Enable re-tries?
 
-        if number_of_claims_of_freeloading > 2:
-            raise self.alice.NotEnoughNodes  # TODO: Clean this up and enable re-tries.
+        if not all(status == 200 for status in statuses.values()):
+            report = "\n".join(f"{address}: {status}" for address, status in statuses.items())
+            self.log.debug(f"Policy enactment failed. Request statuses:\n{report}")
+
+            # OK, let's check: if two or more Ursulas claimed we didn't pay,
+            # we need to re-evaulate our situation here.
+            number_of_claims_of_freeloading = sum(status == 402 for status in statuses.values())
+
+            if number_of_claims_of_freeloading > 2:
+                raise self.alice.NotEnoughNodes
+
+            # otherwise just raise a more generic error
+            raise Policy.EnactmentError()
 
     def _propose_arrangement(self, ursula, network_middleware: RestMiddleware, arrangement):
+        self.log.debug(f"Proposing arrangement {arrangement} to {ursula}")
         negotiation_response = network_middleware.propose_arrangement(ursula, arrangement)
-        is_accepted = negotiation_response.status_code == 200
+        status = negotiation_response.status_code
 
-        #except NodeSeemsToBeDown as e:  # TODO: #355 Also catch InvalidNode here?
-        #    raise
-
-        if not is_accepted:
-            self.log.debug(f"Arrangement failed with {ursula}")
-            raise Exception
-
-        self.log.debug(f"Arrangement accepted by {ursula}")
+        if status == 200:
+            self.log.debug(f"Arrangement accepted by {ursula}")
+        else:
+            message = f"Proposing arrangement to {ursula} failed with {status}"
+            self.log.debug(message)
+            raise RuntimeError(message)
 
     async def _try_propose_arrangement(self, address,
             network_middleware: RestMiddleware,
@@ -531,6 +536,8 @@ class Policy(ABC):
             discover_on_this_thread: bool = False,
             learner_timeout = 1, # TODO: remove hardcoding
         ):
+
+        self.log.debug(f"Trying to learn about {address}")
 
         while True:
             self.alice.block_until_specific_nodes_are_known([address],
@@ -573,26 +580,37 @@ class Policy(ABC):
         value_factory = PrefetchStrategy(lazy_reservoir, self.n)
 
         async def worker(address):
-            arrangement = self.make_arrangement()
+            arrangement = Arrangement.from_alice(alice=self.alice, expiration=self.expiration)
             return await self._try_propose_arrangement(
                 address, network_middleware, arrangement, discover_on_this_thread, draw_timeout)
 
-        arrangements, failures = run_workers_sync(worker, value_factory, self.n, 10, 1)
+        arrangements, failures = run_workers_sync(worker, value_factory, self.n, timeout, draw_timeout)
 
-        for ursula, arrangement in arrangements:
+        for ursula, arrangement in arrangements.values():
             accepted_arrangements[ursula] = arrangement
 
+        accepted_addresses = ", ".join(ursula.checksum_address for ursula in accepted_arrangements)
+
         if len(arrangements) < self.n:
-            # TODO: can report on failures here
-            raise self.Rejected(f"Only got {len(arrangements)} out of {self.n}.")
+
+            rejected_proposals = "\n".join(f"{address}: {exception}" for address, exception in failures.items())
+
+            self.log.debug(
+                "Could not find enough Ursulas to accept proposals.\n"
+                "Accepted: {accepted_addresses}\n"
+                "Rejected:\n{rejected_proposals}")
+            raise self._not_enough_ursulas_exception()
+        else:
+            self.log.debug("Finished proposing arrangements; accepted: {accepted_addresses}")
 
         return accepted_arrangements
 
-    def make_arrangement(self):
-        return Arrangement.from_alice(alice=self.alice, expiration=self.expiration)
-
     @abstractmethod
     def _blockchain_signer(self):
+        raise NotImplementedError
+
+    @abstractmethod
+    def _not_enough_ursulas_exception(self):
         raise NotImplementedError
 
 
@@ -603,6 +621,9 @@ class FederatedPolicy(Policy):
     def _blockchain_signer(self):
         return None
 
+    def _not_enough_ursulas_exception(self):
+        return Policy.NotEnoughUrsulas
+
 
 class BlockchainPolicy(Policy):
     """
@@ -611,16 +632,10 @@ class BlockchainPolicy(Policy):
 
     from nucypher.policy.collections import SignedTreasureMap as _treasure_map_class  # TODO: Circular Import
 
-    class NoSuchPolicy(Exception):
-        pass
-
-    class InvalidPolicy(Exception):
-        pass
-
     class InvalidPolicyValue(ValueError):
         pass
 
-    class NotEnoughBlockchainUrsulas(Policy.MoreKFragsThanArrangements):
+    class NotEnoughBlockchainUrsulas(Policy.NotEnoughUrsulas):
         pass
 
     def __init__(self,
@@ -631,18 +646,16 @@ class BlockchainPolicy(Policy):
                  expiration: maya.MayaDT,
                  *args, **kwargs):
 
+        super().__init__(alice=alice, expiration=expiration, *args, **kwargs)
+
         self.duration_periods = duration_periods
-        self.expiration = expiration
         self.value = value
         self.rate = rate
 
-        # Initial State
-        self.publish_transaction = None
-        self.receipt = None
-
-        super().__init__(alice=alice, expiration=expiration, *args, **kwargs)
-
         self.validate_fee_value()
+
+    def _not_enough_ursulas_exception(self):
+        return BlockchainPolicy.NotEnoughBlockchainUrsulas
 
     def validate_fee_value(self) -> None:
         rate_per_period = self.value // self.n // self.duration_periods  # wei

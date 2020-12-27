@@ -69,7 +69,7 @@ def test_alice_can_grant_even_when_the_first_nodes_she_tries_are_down(federated_
 
     for node in more_nodes:
         federated_alice.remember_node(node)
-    with pytest.raises(Policy.Rejected):
+    with pytest.raises(Policy.NotEnoughUrsulas):
         alice_grant_action()
 
     # Now let's let a few of them come up.
