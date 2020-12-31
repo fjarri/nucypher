@@ -488,7 +488,14 @@ class Policy(ABC):
             make_reservoir = lambda: self.alice.get_stakers_reservoir(duration=self.duration_periods,
                                                                       without=handpicked_addresses)
         else:
-            make_reservoir = lambda: StakersReservoir({ursula.checksum_address: 1 for ursula in self.alice.known_nodes})
+            addresses = {
+                ursula.checksum_address: 1 for ursula in self.alice.known_nodes
+                if ursula.checksum_address not in handpicked_addresses}
+            # Or support an empty dict in StakersReservoir?
+            if len(addresses) > 0:
+                make_reservoir = lambda: StakersReservoir(addresses)
+            else:
+                make_reservoir = None
 
         lazy_reservoir = LazyReservoir(handpicked_addresses, make_reservoir)
         value_factory = PrefetchStrategy(lazy_reservoir, self.n)
