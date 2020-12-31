@@ -22,6 +22,11 @@ class Stopped:
     pass
 
 
+def debug_print(*args):
+    #print(*args)
+    pass
+
+
 class WorkerPool:
 
     def __init__(self, worker, value_factory, target_successes, timeout, stagger_timeout, threadpool_size=None):
@@ -57,32 +62,33 @@ class WorkerPool:
         self._stopped = False
 
     def start(self):
+        # TODO: check if already started?
         self.threadpool.start()
 
     def _bail_on_timeout(self):
-        print("    * _bail_on_timeout() running in thread", get_ident())
+        debug_print("    * _bail_on_timeout() running in thread", get_ident())
         self._cancel_event.wait(timeout=self.timeout)
-        print("    _bail_on_timeout() finished waiting")
+        debug_print("    _bail_on_timeout() finished waiting")
         self._cancel_event.set()
 
-    def _cancel(self):
-        print("    _cancel()")
+    def cancel(self):
+        debug_print("    _cancel()")
         self._cancel_event.set()
 
     def join(self):
-        print("    * join() running in thread", get_ident())
+        debug_print("    * join() running in thread", get_ident())
         if self._stopped:
             return # or raise AlreadyStopped?
 
         self._producer_finished.wait()
         self._processor_finished.wait()
-        print("    join() stopping pool")
+        debug_print("    join() stopping pool")
         # protect from a possible race
         try:
             self.threadpool.stop()
         except AlreadyQuit:
             pass
-        print("    join() done")
+        debug_print("    join() done")
         self._stopped = True
 
     class _Cancelled(Exception):
@@ -90,14 +96,14 @@ class WorkerPool:
 
     def _sleep(self, timeout):
         if self._cancel_event.wait(timeout):
-            print("    _sleep() raising Cancelled")
+            debug_print("    _sleep() raising Cancelled")
             raise self._Cancelled
 
     def block_until_target_successes(self, timeout=None):
         self._success_event.wait(timeout=timeout)
 
     def worker_wrapper(self, value):
-        print("    Starting worker for", value)
+        debug_print("    Starting worker for", value)
         try:
             result = self.worker(self._sleep, value)
             self._result_queue.put(Success(value, result))
@@ -107,17 +113,17 @@ class WorkerPool:
             self._result_queue.put(Failure(value, str(e)))
 
     def _process_results(self):
-        print("    * _process_results() running in thread", get_ident())
+        debug_print("    * _process_results() running in thread", get_ident())
         producer_stopped = False
         while True:
             result = self._result_queue.get()
 
+            # Assuming here that all values are unique!
+
             if isinstance(result, Stopped):
                 print("    _process_results() producer stopped")
                 producer_stopped = True
-                continue
-
-            if isinstance(result, Success):
+            elif isinstance(result, Success):
                 self.successes[result.value] = result.result
             elif isinstance(result, Failure):
                 print("    _process_results() failure", result.exception)
@@ -125,13 +131,13 @@ class WorkerPool:
             elif isinstance(result, self._Cancelled):
                 self._cancelled += 1
 
-            print("    _process_results()", len(self.successes), len(self.failures), self._cancelled, self._tasks)
+            debug_print("    _process_results()", len(self.successes), len(self.failures), self._cancelled, self._tasks)
 
-            if len(self.successes) == self.target_successes:
+            if not isinstance(result, Stopped) and len(self.successes) == self.target_successes:
                 self._success_event.set()
 
             if producer_stopped and len(self.successes) + len(self.failures) + self._cancelled == self._tasks:
-                self._cancel() # to cancel the timeout
+                self.cancel() # to cancel the timeout
                 self._success_event.set() # to prevent infinite blocking for threads waiting on it
 
                 # For some reason thread_pool.stop() does not wait for all threads to stop. Go figure.
@@ -139,16 +145,18 @@ class WorkerPool:
                 self._processor_finished.set()
                 break
 
+        debug_print("    _process_results() stopped")
+
     def _start_batch(self):
-        print("    * _start_batch() running in thread", get_ident())
+        debug_print("    * _start_batch() running in thread", get_ident())
         while True:
             # TODO: what if it raises something?
             batch = self.value_factory(len(self.successes))
-            print("    _start_batch()", batch)
+            debug_print("    _start_batch()", batch)
             if not batch:
                 break
 
-            print("    _start_batch() creating threads")
+            debug_print("    _start_batch() creating threads")
             self._tasks += len(batch)
             for value in batch:
                 self.threadpool.callInThread(self.worker_wrapper, value)
@@ -158,7 +166,7 @@ class WorkerPool:
             except self._Cancelled:
                 break
 
-        print("    _start_batch() finishing")
+        debug_print("    _start_batch() finishing")
         self._producer_finished.set()
         self._result_queue.put(Stopped())
 

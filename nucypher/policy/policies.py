@@ -26,7 +26,6 @@ import math
 import maya
 import random
 import time
-import trio
 from abc import ABC, abstractmethod
 from bytestring_splitter import BytestringSplitter, VariableLengthBytestring
 from constant_sorrow.constants import NOT_SIGNED, UNKNOWN_KFRAG
@@ -144,47 +143,6 @@ class NodeEngagementMutex:
 
     def block_until_complete(self):
         self._worker_pool.join()
-
-
-async def run_workers(worker, value_factory, max_successes, timeout, stagger_timeout):
-
-    successes = {}
-    failures = {}
-
-    async def worker_wrapper(worker, value, cancel):
-        try:
-            result = await worker(value)
-            successes[value] = result
-            if len(successes) >= max_successes:
-                cancel()
-        except Exception as e:
-            failures[value] = e
-
-    with trio.move_on_after(timeout):
-        async with trio.open_nursery() as nursery:
-            cancel = nursery.cancel_scope.cancel
-
-            while True:
-                batch = value_factory(len(successes))
-
-                if not batch:
-                    break
-
-                for value in batch:
-                    nursery.start_soon(worker_wrapper, worker, value, cancel)
-
-                await trio.sleep(stagger_timeout)
-
-    # Due to a race in worker_wrapper(), we can end up with more than `max_successes` successes.
-    # Just discard the excess ones.
-    for _ in range(len(successes) - max_successes):
-        successes.popitem()
-
-    return successes, failures
-
-
-def run_workers_sync(*args):
-    return trio.run(run_workers, *args)
 
 
 class LazyReservoir:
@@ -444,7 +402,7 @@ class Policy(ABC):
             self.log.debug(message)
             raise RuntimeError(message)
 
-    async def _try_propose_arrangement(self, address,
+    def _try_propose_arrangement(self, sleep, address,
             network_middleware: RestMiddleware,
             arrangement,
             discover_on_this_thread: bool = False,
@@ -461,10 +419,9 @@ class Policy(ABC):
             if address in self.alice.known_nodes:
                 break
 
-            await trio.sleep(0)
+            sleep(0) # checkpoint for canceling
 
         ursula = self.alice.known_nodes[address]
-
         self._propose_arrangement(ursula, network_middleware, arrangement)
 
         return (ursula, arrangement)
@@ -500,12 +457,20 @@ class Policy(ABC):
         lazy_reservoir = LazyReservoir(handpicked_addresses, make_reservoir)
         value_factory = PrefetchStrategy(lazy_reservoir, self.n)
 
-        async def worker(address):
+        def worker(sleep, address):
             arrangement = Arrangement.from_alice(alice=self.alice, expiration=self.expiration)
-            return await self._try_propose_arrangement(
-                address, network_middleware, arrangement, discover_on_this_thread, draw_timeout)
+            return self._try_propose_arrangement(
+                sleep, address, network_middleware, arrangement, discover_on_this_thread, draw_timeout)
 
-        arrangements, failures = run_workers_sync(worker, value_factory, self.n, timeout, draw_timeout)
+        worker_pool = WorkerPool(worker, value_factory, self.n, timeout, draw_timeout, threadpool_size=self.n)
+        worker_pool.start()
+        worker_pool.block_until_target_successes()
+        worker_pool.cancel()
+        worker_pool.join()
+        arrangements = worker_pool.successes
+        failures = worker_pool.failures
+
+        #arrangements, failures = run_workers_sync(worker, value_factory, self.n, timeout, draw_timeout)
 
         for ursula, arrangement in arrangements.values():
             accepted_arrangements[ursula] = arrangement
