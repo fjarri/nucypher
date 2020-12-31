@@ -134,7 +134,9 @@ def test_alice_verifies_ursula_just_in_time(fleet_of_highperf_mocked_ursulas,
                                     publish_treasure_map=False)
     # TODO: Make some assertions about policy.
     total_verified = sum(node.verified_node for node in highperf_mocked_alice.known_nodes)
-    assert total_verified == 30
+    # Alice may be able to verify more than `n`, but certainly not less,
+    # otherwise `grant()` would fail.
+    assert total_verified >= 30
     _POLICY_PRESERVER.append(policy)
 
 
