@@ -65,6 +65,7 @@ def select_test_port() -> int:
 def make_federated_ursulas(ursula_config: UrsulaConfiguration,
                            quantity: int = NUMBER_OF_URSULAS_IN_DEVELOPMENT_NETWORK,
                            know_each_other: bool = True,
+                           shared_db_files: bool = False,
                            **ursula_overrides) -> Set[Ursula]:
 
     if not MOCK_KNOWN_URSULAS_CACHE:
@@ -76,8 +77,13 @@ def make_federated_ursulas(ursula_config: UrsulaConfiguration,
 
     for port in range(starting_port, starting_port+quantity):
 
+        if shared_db_files:
+            db_filepath = MOCK_URSULA_DB_FILEPATH
+        else:
+            db_filepath = tempfile.mkdtemp()
+
         ursula = ursula_config.produce(rest_port=port + 100,
-                                       db_filepath=MOCK_URSULA_DB_FILEPATH,
+                                       db_filepath=db_filepath,
                                        **ursula_overrides)
 
         federated_ursulas.add(ursula)

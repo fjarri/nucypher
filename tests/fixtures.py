@@ -938,7 +938,8 @@ def fleet_of_highperf_mocked_ursulas(ursula_federated_test_config, request):
         with mock_secret_source():
             with mock_cert_storage, mock_cert_loading, mock_rest_app_creation, mock_cert_generation, mock_remember_node, mock_message_verification:
                 _ursulas = make_federated_ursulas(ursula_config=ursula_federated_test_config,
-                                                  quantity=quantity, know_each_other=False)
+                                                  quantity=quantity, know_each_other=False,
+                                                  shared_db_files=True)
                 all_ursulas = {u.checksum_address: u for u in _ursulas}
 
                 for ursula in _ursulas:
