@@ -1,7 +1,7 @@
 import weakref
 import time
 from queue import Queue, Empty
-from threading import Event, Lock, Timer, get_ident
+from threading import Thread, Event, Lock, Timer, get_ident
 
 from twisted._threads import AlreadyQuit
 from twisted.python.threadpool import ThreadPool
@@ -45,9 +45,9 @@ class WorkerPool:
             thread_pool_kwargs['maxthreads'] = threadpool_size
         self.threadpool = ThreadPool(**thread_pool_kwargs)
 
-        self.threadpool.callInThread(self._bail_on_timeout)
-        self.threadpool.callInThread(self._start_batch)
-        self.threadpool.callInThread(self._process_results)
+        self._bail_on_timeout_thread = Thread(target=self._bail_on_timeout)
+        self._start_batch_thread = Thread(target=self._start_batch)
+        self._process_results_thread = Thread(target=self._process_results)
 
         self.successes = {}
         self.failures = {}
@@ -64,6 +64,9 @@ class WorkerPool:
     def start(self):
         # TODO: check if already started?
         self.threadpool.start()
+        self._start_batch_thread.start()
+        self._process_results_thread.start()
+        self._bail_on_timeout_thread.start()
 
     def _bail_on_timeout(self):
         debug_print("    * _bail_on_timeout() running in thread", get_ident())
@@ -83,6 +86,11 @@ class WorkerPool:
         self._producer_finished.wait()
         self._processor_finished.wait()
         debug_print("    join() stopping pool")
+
+        self._start_batch_thread.join()
+        self._process_results_thread.join()
+        self._bail_on_timeout_thread.join()
+
         # protect from a possible race
         try:
             self.threadpool.stop()
@@ -121,12 +129,12 @@ class WorkerPool:
             # Assuming here that all values are unique!
 
             if isinstance(result, Stopped):
-                print("    _process_results() producer stopped")
+                debug_print("    _process_results() producer stopped")
                 producer_stopped = True
             elif isinstance(result, Success):
                 self.successes[result.value] = result.result
             elif isinstance(result, Failure):
-                print("    _process_results() failure", result.exception)
+                debug_print("    _process_results() failure", result.exception)
                 self.failures[result.value] = result.exception
             elif isinstance(result, self._Cancelled):
                 self._cancelled += 1
