@@ -467,7 +467,7 @@ class Policy(ABC):
         worker_pool.block_until_target_successes()
         worker_pool.cancel()
         worker_pool.join()
-        arrangements = worker_pool.successes
+        arrangements = {key: val for key, val in list(worker_pool.successes.items())[:self.n]}
         failures = worker_pool.failures
 
         #arrangements, failures = run_workers_sync(worker, value_factory, self.n, timeout, draw_timeout)
