@@ -57,8 +57,6 @@ class WorkerPool:
         self._cancel_event = Event()
         self._result_queue = Queue()
         self._success_event = Event()
-        self._producer_finished = Event()
-        self._processor_finished = Event()
         self._stopped = False
 
     def start(self):
@@ -83,8 +81,6 @@ class WorkerPool:
         if self._stopped:
             return # or raise AlreadyStopped?
 
-        self._producer_finished.wait()
-        self._processor_finished.wait()
         debug_print("    join() stopping pool")
 
         self._start_batch_thread.join()
@@ -147,10 +143,6 @@ class WorkerPool:
             if producer_stopped and len(self.successes) + len(self.failures) + self._cancelled == self._tasks:
                 self.cancel() # to cancel the timeout
                 self._success_event.set() # to prevent infinite blocking for threads waiting on it
-
-                # For some reason thread_pool.stop() does not wait for all threads to stop. Go figure.
-                # So we're adding an explicit event to know that all workers are finished.
-                self._processor_finished.set()
                 break
 
         debug_print("    _process_results() stopped")
@@ -175,7 +167,6 @@ class WorkerPool:
                 break
 
         debug_print("    _start_batch() finishing")
-        self._producer_finished.set()
         self._result_queue.put(Stopped())
 
 
