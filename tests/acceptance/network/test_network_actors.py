@@ -170,6 +170,11 @@ def test_treasure_map_cannot_be_duplicated(blockchain_ursulas,
                                     rate=int(1e18),  # one ether
                                     expiration=policy_end_datetime)
 
+    # Wait until the treasure map is distributed
+    # (we only need it on one Ursula, `first_matching_ursula`,
+    # but waiting for full completion is simpler)
+    policy.publishing_mutex.block_until_complete()
+
     matching_ursulas = blockchain_bob.matching_nodes_among(blockchain_ursulas)
     first_matching_ursula = matching_ursulas[0]
 
